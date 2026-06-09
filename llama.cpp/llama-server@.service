@@ -1,0 +1,22 @@
+[Unit]
+Description=llama.cpp server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/models/%i
+EnvironmentFile=/opt/models/%i/default
+Environment="RADV_PERFTEST=nogttspill"
+ExecStart=/opt/llama.cpp/llama-b8880/llama-server \
+    --host 0.0.0.0 --port $SERVER_PORT $SERVER_ARGS
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+MemoryMax=6G
+MemoryHigh=4G
+
+[Install]
+WantedBy=multi-user.target

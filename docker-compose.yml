@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  paddleocr-daemon:
+    build: ./
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      - paddleocr-models:/root/.paddlex
+      - /root/.paddleocr:/etc/paddleocr
+    shm_size: 8g
+volumes:
+  paddleocr-models:

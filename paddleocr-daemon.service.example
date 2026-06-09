@@ -1,0 +1,16 @@
+[Unit]
+Description=PaddleOCR Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/paddleocr/paddleocr.conf
+WorkingDirectory=/opt/paddleocr-daemon
+ExecStart=/usr/bin/python3 /opt/paddleocr-daemon/daemon.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

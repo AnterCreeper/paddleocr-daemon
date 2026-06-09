@@ -1,0 +1,38 @@
+# Configuration for paddleocr-daemon
+# Located at /etc/paddleocr/paddleocr.conf inside the container.
+# Mount a persistent host directory to /etc/paddleocr to override defaults.
+# This file also works as a systemd EnvironmentFile.
+
+# Paddle device: cpu | gpu
+PADDLE_DEVICE=cpu
+OMP_NUM_THREADS=8
+
+# PaddleOCR-VL pipeline version
+PIPELINE_VERSION=v1.6
+
+# Remote VLM backend configuration
+VLM_BACKEND=llama-cpp-server
+VLM_SERVER_URL=http://127.0.0.1:3000/v1
+VLM_API_KEY=no-key
+
+# Preferred PaddleX model source
+PADDLE_PDX_MODEL_SOURCE=modelscope
+PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+
+# Build-time / startup behavior
+PREFORK_MODELS=1
+
+# HTTP API listen address
+API_HOST=0.0.0.0
+API_PORT=8080
+
+# Optional Bearer token auth for POST endpoints
+# If set, clients must send: Authorization: Bearer <API_TOKEN>
+#API_TOKEN=
+
+# Runtime directories
+# OUTPUT_DIR is reserved for a future feature that will persist parsed request
+# results for offline analysis and system-quality evaluation. It is not used by
+# the current daemon implementation yet.
+#TMP_DIR=/tmp/paddleocr
+#OUTPUT_DIR=/root/output

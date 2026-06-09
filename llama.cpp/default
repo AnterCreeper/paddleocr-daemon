@@ -1,0 +1,6 @@
+SERVER_PORT=3456
+SERVER_ARGS="-m PaddleOCR-VL-1.6.gguf \
+  --mmproj PaddleOCR-VL-1.6.mmproj.gguf \
+  -c 4096 --parallel 4 -ngl 99 -fa on --temp 0 \
+  --no-context-shift --special --kv-unified \
+  --jinja --chat-template-file chat_template.jinja"
