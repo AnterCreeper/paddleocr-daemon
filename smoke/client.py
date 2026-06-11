@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import re
+import os
 import shutil
 import time
 from pathlib import Path
@@ -61,6 +61,12 @@ def main() -> int:
     parser.add_argument("output_dir")
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--token", default="")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("PREDICT_TIMEOUT", "600")),
+        help="request timeout in seconds; defaults to PREDICT_TIMEOUT",
+    )
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf_path)
@@ -87,7 +93,7 @@ def main() -> int:
         f"{args.base_url}/layout-parsing",
         headers=headers,
         json=payload,
-        timeout=5400,
+        timeout=args.timeout,
     )
     elapsed = time.time() - start
     print("PARSE", response.status_code)

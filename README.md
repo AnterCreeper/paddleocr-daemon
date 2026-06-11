@@ -26,21 +26,32 @@ API/SDK contract.
 curl http://127.0.0.1:8080/health
 ```
 
-The HTTP status code reflects daemon liveness (always `200` while the daemon is
-running). The response body additionally reports whether the configured
-`VLM_SERVER_URL` is reachable and returns a valid OpenAI-compatible `/v1/models`
-response.
+Returns HTTP `200` while the daemon is running:
 
 ```json
-{
-  "status": "ok",
-  "service": "paddleocr-daemon",
-  "vlmBackend": "llama-cpp-server",
-  "vlmServerUrl": "http://127.0.0.1:3000/v1",
-  "vlmReachable": true,
-  "vlmDetail": "reachable (200), 3 model(s) listed"
-}
+{"logId": "...", "errorCode": 0, "errorMsg": "Healthy"}
 ```
+
+### Readiness
+
+```bash
+curl http://127.0.0.1:8080/ready
+```
+
+Probes whether the configured VLM backend is reachable. Returns `200` if
+ready, `503` otherwise:
+
+```json
+{"logId": "...", "errorCode": 0, "errorMsg": "Ready"}
+```
+
+```json
+{"logId": "...", "errorCode": 1, "errorMsg": "Service unavailable"}
+```
+
+Note: the daemon does not implement the full PaddleOCR cloud `jobs` API/SDK
+contract, but the health/ready response shape follows the AIStudio convention
+(`logId` / `errorCode` / `errorMsg`).
 
 ### JSON API
 
@@ -54,7 +65,7 @@ curl -X POST http://127.0.0.1:8080/layout-parsing \
   }'
 ```
 
-`fileType=0` means PDF, `fileType=1` means image.
+`fileType=0` means PDF, `fileType=1` means image (the default when omitted).
 
 Extra request fields are ignored.
 
@@ -96,6 +107,7 @@ Notes:
 - `layoutParsingResults` is a per-page array. The daemon does not merge pages into a single markdown document.
 - `markdown.images` keys are intended to match the relative image references embedded in `markdown.text`.
 - In current PaddleOCR-VL output, embedded image references often use paths such as `imgs/...`, but this is part of the markdown content generated upstream rather than a daemon-enforced directory contract.
+- Per-page pass-through fields (`prunedResult`, `outputImages`, `inputImage`, `exports`): the daemon preserves these fields verbatim from the upstream pipeline result when present. In current PaddleOCR-VL versions these fields are typically absent; they are kept as a forward-compatibility slot in case future pipeline versions emit additional metadata.
 
 ## Configuration
 
@@ -139,6 +151,71 @@ About `OUTPUT_DIR`:
 - The intended use is to capture all parsed request results for user-data
   analysis and system-effectiveness research
 - The current daemon does not implement this persistence behavior yet
+
+## Known Limitations
+
+### In-Flight Task Cancellation Not Supported
+
+Once a `POST /layout-parsing` request is accepted and the underlying
+`PaddleOCRVL.predict()` call has started, **the task cannot be cancelled**,
+even if the client disconnects or closes the HTTP connection early.
+
+If the request is still queued behind another parse job, the daemon can cancel
+it before it enters `PaddleOCRVL.predict()`.
+
+This is a fundamental limitation of the current PaddleOCR / PaddleX Python
+API:
+
+- `PaddleOCRVL.predict()` is a synchronous, blocking call with no exposed
+cancellation mechanism.
+- Internally it performs CPU-intensive layout detection and GPU-bound VLM
+inference; neither stage accepts an external abort signal.
+- The daemon's `ThreadPoolExecutor` can cancel queued work, but it does not
+terminate an already-running thread.
+
+Consequences:
+- A disconnected client only stops server-side work if the request is still
+queued; once prediction has started, resources (CPU, GPU memory, VLM backend
+slots) remain occupied until the pipeline finishes or hits `PREDICT_TIMEOUT`
+(default 600 s).
+- Retries from the client can stack up and worsen resource contention.
+
+## Future Roadmap
+
+Two complementary directions are under consideration to mitigate the
+above limitation.
+
+### 1. Process-Per-Request with External Kill
+
+Replace the single-thread executor with lightweight worker **processes**
+(e.g. `multiprocessing.Process`).  If the client connection drops, the
+daemon can send `SIGTERM` (or `SIGKILL`) to the specific worker process,
+forcibly reclaiming resources.  This is the only robust way to cancel an
+in-flight PaddleOCR task without upstream library changes.
+
+Trade-offs:
+- Higher per-request overhead (process spawn / model re-initialisation
+unless a pre-fork pool is used).
+- Requires careful handling of shared state and temporary files.
+
+### 2. Result Caching via `OUTPUT_DIR`
+
+Use `OUTPUT_DIR` as a persistent cache layer:
+
+1. Hash the incoming file payload (e.g. SHA-256 of the base64-decoded
+bytes).
+2. Check whether a folder named after that hash already exists under
+`OUTPUT_DIR`.
+   - **Hit**: Return the previously computed result directly without
+calling `pipeline.predict()`.
+   - **Miss**: Run the pipeline, persist the result under the hash-named
+folder, and return it.
+
+Benefits:
+- Eliminates redundant work for identical files.
+- Reduces the *effective* time a client must wait, lowering the chance
+of timeouts and disconnections.
+- Aligns with the existing forward-looking `OUTPUT_DIR` contract.
 
 ## Docker Compose
 

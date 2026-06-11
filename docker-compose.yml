@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   paddleocr-daemon:
     container_name: paddleocr-daemon
@@ -12,5 +10,11 @@ services:
       - paddleocr-models:/root/.paddlex
       - /root/.paddleocr:/etc/paddleocr
     shm_size: 8g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 volumes:
   paddleocr-models:

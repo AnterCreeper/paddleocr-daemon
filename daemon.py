@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import base64
 import hmac
+import inspect
 import io
 import json
 import os
+import select
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -28,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
@@ -46,6 +49,7 @@ TMP_DIR = os.environ.get("TMP_DIR", "/tmp/paddleocr")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/root/output")
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
 PREDICT_TIMEOUT = int(os.environ.get("PREDICT_TIMEOUT", "600"))
+READY_CACHE_TTL = float(os.environ.get("READY_CACHE_TTL", "5"))
 
 Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -63,11 +67,22 @@ class ProcessingError(Exception):
         super().__init__(msg)
 
 
+class ClientDisconnected(Exception):
+    """Raised when the HTTP client closes the connection before completion."""
+
+    def __init__(self, cancelled: bool):
+        self.cancelled = cancelled
+        super().__init__("client disconnected")
+
+
 # ---------------------------------------------------------------------------
 # Lazy pipeline (loaded on first request to keep startup fast)
 # ---------------------------------------------------------------------------
 _pipeline = None
 _pipeline_lock = threading.Lock()
+_predict_executor = ThreadPoolExecutor(max_workers=1)
+_ready_cache_lock = threading.Lock()
+_ready_cache: tuple[float, bool, str] | None = None
 
 
 def _get_pipeline():
@@ -99,10 +114,14 @@ def _get_result_field(result: Any, *keys: str) -> Any:
     for key in keys:
         if isinstance(result, dict) and key in result:
             return result[key]
+        if result is None:
+            continue
         try:
-            return getattr(result, key)
+            inspect.getattr_static(result, key)
         except AttributeError:
-            pass
+            continue
+        else:
+            return getattr(result, key)
     return None
 
 
@@ -120,8 +139,6 @@ def _encode_image_map(image_map: Any) -> dict[str, str]:
             buffer = io.BytesIO()
             data.save(buffer, format="PNG")
             images[str(name)] = base64.b64encode(buffer.getvalue()).decode("ascii")
-        else:
-            images[str(name)] = str(data)
     return images
 
 
@@ -147,10 +164,7 @@ def _extract_markdown_text(predict_result) -> str:
         if value is not None:
             return str(value)
 
-    try:
-        return str(md_result)
-    except Exception:
-        return ""
+    return ""
 
 
 def _result_to_response(log_id: str, output) -> dict[str, Any]:
@@ -252,6 +266,8 @@ def _is_vlm_backend_reachable() -> tuple[bool, str]:
                 return False, "invalid /models response: expected JSON object"
 
             models = payload.get("data")
+            if models is None and isinstance(payload.get("models"), list):
+                models = payload.get("models")
             if not isinstance(models, list) or not models:
                 return False, "invalid /models response: missing non-empty data list"
 
@@ -265,6 +281,23 @@ def _is_vlm_backend_reachable() -> tuple[bool, str]:
             return True, f"reachable ({status}), {len(models)} model(s) listed"
     except Exception as exc:
         return False, f"vlm backend probe failed: {type(exc).__name__}: {exc}"
+
+
+def _is_vlm_backend_ready_cached() -> tuple[bool, str]:
+    """Cache readiness probes so frequent health checks do not hammer VLM."""
+    global _ready_cache
+
+    now = time.monotonic()
+    with _ready_cache_lock:
+        if _ready_cache is not None:
+            cached_at, ok, detail = _ready_cache
+            if now - cached_at < READY_CACHE_TTL:
+                return ok, f"{detail} (cached)"
+
+    ok, detail = _is_vlm_backend_reachable()
+    with _ready_cache_lock:
+        _ready_cache = (time.monotonic(), ok, detail)
+    return ok, detail
 
 
 def _get_request_length(headers) -> int:
@@ -314,46 +347,33 @@ class Handler(BaseHTTPRequestHandler):
                         error="not found")
 
     def _handle_health(self, started_at: float) -> None:
-        self._send_json(200, {"status": "ok", "service": "paddleocr-daemon"})
+        log_id = uuid.uuid4().hex[:12]
+        self._send_json(200, {
+            "logId": log_id,
+            "errorCode": 0,
+            "errorMsg": "Healthy",
+        })
         self._log_event("health_check", path="/health", status=200,
                         durationMs=int((time.monotonic() - started_at) * 1000))
 
     def _handle_ready(self, started_at: float) -> None:
-        vlm_ok, vlm_detail = _is_vlm_backend_reachable()
+        log_id = uuid.uuid4().hex[:12]
+        vlm_ok, vlm_detail = _is_vlm_backend_ready_cached()
         if not vlm_ok:
             self._send_json(503, {
-                "status": "not_ready",
-                "service": "paddleocr-daemon",
-                "vlmBackend": VLM_BACKEND,
-                "vlmServerUrl": VLM_SERVER_URL,
-                "reason": vlm_detail,
+                "logId": log_id,
+                "errorCode": 1,
+                "errorMsg": "Service unavailable",
             })
             self._log_event("readiness_check", path="/ready", status=503,
                             durationMs=int((time.monotonic() - started_at) * 1000),
                             error=vlm_detail)
             return
 
-        try:
-            _get_pipeline()
-        except Exception as exc:
-            msg = f"pipeline init failed: {type(exc).__name__}: {exc}"
-            self._send_json(503, {
-                "status": "not_ready",
-                "service": "paddleocr-daemon",
-                "vlmBackend": VLM_BACKEND,
-                "vlmServerUrl": VLM_SERVER_URL,
-                "reason": msg,
-            })
-            self._log_event("readiness_check", path="/ready", status=503,
-                            durationMs=int((time.monotonic() - started_at) * 1000),
-                            error=msg)
-            return
-
         self._send_json(200, {
-            "status": "ready",
-            "service": "paddleocr-daemon",
-            "vlmBackend": VLM_BACKEND,
-            "vlmServerUrl": VLM_SERVER_URL,
+            "logId": log_id,
+            "errorCode": 0,
+            "errorMsg": "Ready",
         })
         self._log_event("readiness_check", path="/ready", status=200,
                         durationMs=int((time.monotonic() - started_at) * 1000))
@@ -407,6 +427,14 @@ class Handler(BaseHTTPRequestHandler):
             result = self._process_file(log_id, file_data, file_type)
             self._send_json(200, result)
             self._log_request(log_id, "/layout-parsing", 200, started_at)
+        except ClientDisconnected as exc:
+            self._log_request(
+                log_id,
+                "/layout-parsing",
+                499,
+                started_at,
+                error=f"client disconnected; cancelled={exc.cancelled}",
+            )
         except ProcessingError as exc:
             self._send_json(exc.http_status, _error_response(log_id, exc.error_code, str(exc)))
             self._log_request(log_id, "/layout-parsing", exc.http_status, started_at, error=str(exc))
@@ -433,6 +461,7 @@ class Handler(BaseHTTPRequestHandler):
 
         suffix = ".pdf" if file_type == 0 else ".png"
         fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=TMP_DIR)
+        keep_tmp_path = False
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(raw)
@@ -440,27 +469,86 @@ class Handler(BaseHTTPRequestHandler):
             pipeline = _get_pipeline()
 
             sys.stderr.write(f"[daemon] [{log_id}] running pipeline on {tmp_path}\n")
-            executor = ThreadPoolExecutor(max_workers=1)
             try:
-                future = executor.submit(pipeline.predict, tmp_path)
-                output = future.result(timeout=PREDICT_TIMEOUT)
+                future = _predict_executor.submit(pipeline.predict, tmp_path)
+                output = self._wait_for_predict(log_id, future, tmp_path)
+            except ClientDisconnected as exc:
+                if not exc.cancelled:
+                    keep_tmp_path = True
+                raise
             except FutureTimeoutError:
+                if not future.cancel():
+                    keep_tmp_path = True
+                    sys.stderr.write(
+                        f"[daemon] [{log_id}] timed out; keeping temp file "
+                        f"for still-running pipeline: {tmp_path}\n"
+                    )
                 raise ProcessingError(
                     504,
                     f"pipeline predict timed out after {PREDICT_TIMEOUT}s",
                     error_code=2,
                 )
-            finally:
-                executor.shutdown(wait=False)
             sys.stderr.write(f"[daemon] [{log_id}] pipeline returned {len(output)} pages\n")
 
             result = _result_to_response(log_id, output)
             return result
         finally:
+            if not keep_tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _wait_for_predict(self, log_id: str, future, tmp_path: str):
+        deadline = time.monotonic() + PREDICT_TIMEOUT
+        done_reader, done_writer = socket.socketpair()
+
+        def _notify_done(_future) -> None:
             try:
-                os.unlink(tmp_path)
+                done_writer.send(b"1")
             except OSError:
                 pass
+
+        future.add_done_callback(_notify_done)
+
+        try:
+            while True:
+                if future.done():
+                    return future.result()
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise FutureTimeoutError()
+
+                readable, _, _ = select.select(
+                    [self.connection, done_reader], [], [], remaining
+                )
+
+                if done_reader in readable:
+                    return future.result()
+
+                if self.connection in readable:
+                    try:
+                        data = self.connection.recv(1, socket.MSG_PEEK)
+                        disconnected = data == b""
+                    except BlockingIOError:
+                        disconnected = False
+                    except (ConnectionError, OSError):
+                        disconnected = True
+
+                    if not disconnected:
+                        continue
+
+                    cancelled = future.cancel()
+                    if not cancelled:
+                        sys.stderr.write(
+                            f"[daemon] [{log_id}] client disconnected; "
+                            f"pipeline already running for {tmp_path}\n"
+                        )
+                    raise ClientDisconnected(cancelled=cancelled)
+        finally:
+            done_reader.close()
+            done_writer.close()
 
     # ------------------------------------------------------------------
     # Utilities
@@ -526,6 +614,7 @@ def main() -> None:
     try:
         httpd.serve_forever()
     finally:
+        _predict_executor.shutdown(wait=False, cancel_futures=True)
         httpd.server_close()
 
 
