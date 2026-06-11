@@ -236,8 +236,10 @@ def _is_authorized(headers) -> bool:
         return True
 
     auth_header = headers.get("Authorization", "")
-    expected = f"Bearer {API_TOKEN}"
-    return hmac.compare_digest(auth_header, expected)
+    scheme, sep, token = auth_header.strip().partition(" ")
+    if not sep or scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(token, API_TOKEN)
 
 
 def _is_vlm_backend_reachable() -> tuple[bool, str]:
