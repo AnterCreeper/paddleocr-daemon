@@ -34,5 +34,5 @@ API_PORT=8080
 # OUTPUT_DIR is reserved for a future feature that will persist parsed request
 # results for offline analysis and system-quality evaluation. It is not used by
 # the current daemon implementation yet.
-#TMP_DIR=/tmp/paddleocr
+TMP_DIR=/tmp/paddleocr
 #OUTPUT_DIR=/root/output

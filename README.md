@@ -26,17 +26,21 @@ API/SDK contract.
 curl http://127.0.0.1:8080/health
 ```
 
-### Readiness
+The HTTP status code reflects daemon liveness (always `200` while the daemon is
+running). The response body additionally reports whether the configured
+`VLM_SERVER_URL` is reachable and returns a valid OpenAI-compatible `/v1/models`
+response.
 
-```bash
-curl http://127.0.0.1:8080/health/ready
+```json
+{
+  "status": "ok",
+  "service": "paddleocr-daemon",
+  "vlmBackend": "llama-cpp-server",
+  "vlmServerUrl": "http://127.0.0.1:3000/v1",
+  "vlmReachable": true,
+  "vlmDetail": "reachable (200), 3 model(s) listed"
+}
 ```
-
-This endpoint verifies:
-
-- the configured `VLM_SERVER_URL` is syntactically valid
-- the remote OpenAI-compatible `/v1/models` endpoint returns a parseable model list
-- the local PaddleOCR-VL pipeline can initialize successfully
 
 ### JSON API
 
@@ -78,12 +82,20 @@ Input scope:
           "images": {
             "img1.png": "<base64>"
           }
-        }
+        },
       }
     ]
   }
 }
 ```
+
+Notes:
+
+- `markdown.text` is normalized from PaddleOCR-VL's local `markdown_texts` field.
+- `markdown.images` is normalized from PaddleOCR-VL's local `markdown_images` field and returned as a per-page embedded asset map.
+- `layoutParsingResults` is a per-page array. The daemon does not merge pages into a single markdown document.
+- `markdown.images` keys are intended to match the relative image references embedded in `markdown.text`.
+- In current PaddleOCR-VL output, embedded image references often use paths such as `imgs/...`, but this is part of the markdown content generated upstream rather than a daemon-enforced directory contract.
 
 ## Configuration
 
@@ -214,6 +226,16 @@ This script will:
 - call `client.py`, which submits the PDF to `layout-parsing`
 - export a bundle directory containing:
   - `content.md`
-  - `images/`
+  - `imgs/`
   - `result.json`
   - `timing.txt`
+
+Smoke bundle behavior:
+
+- The API response is page-oriented. `client.py` performs the local export-time merge into a single `content.md` file.
+- `client.py` inserts `<!-- page N -->` markers while merging pages so the bundle keeps page boundaries visible.
+- `content.md` is the cleaned export artifact from per-page `markdown.text` content.
+- `imgs/` is the current default bundle layout used by `client.py` so local files match upstream markdown image references such as `imgs/...`.
+- The `imgs/` directory is a smoke-export convention, not an HTTP API requirement. SDK or application code may choose a different layout by rewriting markdown references and materializing images accordingly.
+- `result.json` keeps the raw API response for debugging and comparison against the cleaned markdown export.
+- Each smoke run deletes and recreates the target bundle directory so stale files do not linger between runs.

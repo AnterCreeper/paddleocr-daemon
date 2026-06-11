@@ -3,7 +3,7 @@ set -euo pipefail
 
 load_config_defaults() {
     local config_path="$1"
-    local line key
+    local line key value
 
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
@@ -17,6 +17,7 @@ load_config_defaults() {
         case "$line" in
             *=*)
                 key="${line%%=*}"
+                value="${line#*=}"
                 ;;
             *)
                 continue
@@ -27,7 +28,11 @@ load_config_defaults() {
             continue
         fi
 
-        export "$line"
+        # Strip inline comments and trailing whitespace from value
+        value="${value%%#*}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        export "$key=$value"
     done < "$config_path"
 }
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import io
 import json
 import os
 import signal
@@ -23,6 +24,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -43,9 +45,22 @@ API_TOKEN = os.environ.get("API_TOKEN", "")
 TMP_DIR = os.environ.get("TMP_DIR", "/tmp/paddleocr")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/root/output")
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
+PREDICT_TIMEOUT = int(os.environ.get("PREDICT_TIMEOUT", "600"))
 
 Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Processing error — HTTP status is separate from PaddleOCR errorCode
+# ---------------------------------------------------------------------------
+class ProcessingError(Exception):
+    """Known processing error with HTTP status and PaddleOCR error code."""
+
+    def __init__(self, http_status: int, msg: str, error_code: int = 1):
+        self.http_status = http_status
+        self.error_code = error_code
+        super().__init__(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -80,48 +95,57 @@ def _get_pipeline():
 # ---------------------------------------------------------------------------
 # Result helpers
 # ---------------------------------------------------------------------------
-def _collect_markdown_images(predict_result) -> dict[str, str]:
-    """Extract {filename: base64} image map from a PaddleOCR result page."""
+def _get_result_field(result: Any, *keys: str) -> Any:
+    for key in keys:
+        if isinstance(result, dict) and key in result:
+            return result[key]
+        try:
+            return getattr(result, key)
+        except AttributeError:
+            pass
+    return None
+
+
+def _encode_image_map(image_map: Any) -> dict[str, str]:
     images: dict[str, str] = {}
-    try:
-        md_result = predict_result.markdown
-    except Exception:
+    if not isinstance(image_map, dict):
         return images
 
-    if hasattr(md_result, "images") and md_result.images:
-        for name, data in md_result.images.items():
-            if isinstance(data, bytes):
-                images[str(name)] = base64.b64encode(data).decode("ascii")
-            else:
-                images[str(name)] = str(data)
+    for name, data in image_map.items():
+        if data is None:
+            continue
+        if isinstance(data, bytes):
+            images[str(name)] = base64.b64encode(data).decode("ascii")
+        elif hasattr(data, "save"):
+            buffer = io.BytesIO()
+            data.save(buffer, format="PNG")
+            images[str(name)] = base64.b64encode(buffer.getvalue()).decode("ascii")
+        else:
+            images[str(name)] = str(data)
     return images
 
 
-def _extract_markdown_text(predict_result) -> str:
-    """Prefer the actual markdown text field over stringifying the whole object."""
-    try:
-        md_result = predict_result.markdown
-    except Exception:
-        return ""
+def _collect_markdown_images(predict_result) -> dict[str, str]:
+    """Extract {filename: base64} image map from a PaddleOCR result page."""
+    md_result = _get_result_field(predict_result, "markdown")
+    if md_result is None:
+        return {}
 
+    # PaddleOCR-VL local results often expose image assets as
+    # `markdown_images`, while some wrappers/project docs refer to `images`.
+    image_map = _get_result_field(md_result, "markdown_images", "images")
+    return _encode_image_map(image_map)
+
+
+def _extract_markdown_text(predict_result) -> str:
+    md_result = _get_result_field(predict_result, "markdown")
     if md_result is None:
         return ""
 
-    # PaddleOCR/PaddleX may expose markdown results either as a mapping-like
-    # object or as an object with attributes such as `markdown_texts`.
     for key in ("markdown_texts", "text"):
-        try:
-            if isinstance(md_result, dict) and key in md_result and md_result[key] is not None:
-                return str(md_result[key])
-        except Exception:
-            pass
-
-        try:
-            value = getattr(md_result, key)
-            if value is not None:
-                return str(value)
-        except Exception:
-            pass
+        value = _get_result_field(md_result, key)
+        if value is not None:
+            return str(value)
 
     try:
         return str(md_result)
@@ -130,35 +154,25 @@ def _extract_markdown_text(predict_result) -> str:
 
 
 def _result_to_response(log_id: str, output) -> dict[str, Any]:
-    """Convert PaddleOCRVL output list to the API response format."""
     pages: list[dict[str, Any]] = []
     for res in output:
-        md_text = ""
-        images: dict[str, str] = {}
-        try:
-            md_text = _extract_markdown_text(res)
-        except Exception:
-            pass
-
-        try:
-            images = _collect_markdown_images(res)
-        except Exception:
-            pass
-
-        pages.append({
+        page: dict[str, Any] = {
             "markdown": {
-                "text": md_text,
-                "images": images,
+                "text": _extract_markdown_text(res),
+                "images": _collect_markdown_images(res),
             },
-        })
+        }
+        for field in ("prunedResult", "outputImages", "inputImage", "exports"):
+            value = _get_result_field(res, field)
+            if value is not None:
+                page[field] = value
+        pages.append(page)
 
     return {
         "logId": log_id,
         "errorCode": 0,
         "errorMsg": "Success",
-        "result": {
-            "layoutParsingResults": pages,
-        },
+        "result": {"layoutParsingResults": pages},
     }
 
 
@@ -177,7 +191,7 @@ def _normalize_file_type(value: Any) -> int | None:
         return 1
 
     if isinstance(value, bool):
-        return None
+        return None  # bool is a subclass of int; must check before int below
 
     if isinstance(value, int):
         return value if value in (0, 1) else None
@@ -283,52 +297,66 @@ def _validate_raw_size(raw: bytes) -> None:
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "PaddleOCR-Daemon/1.0"
-    timeout = 600  # 10-minute timeout for large PDFs
 
     def do_GET(self) -> None:
         started_at = time.monotonic()
         path = self.path.rstrip("/")
 
         if path == "/health":
-            self._send_json(200, {"status": "ok", "service": "paddleocr-daemon"})
-            self._log_event("health_check", path="/health", status=200, durationMs=int((time.monotonic() - started_at) * 1000))
+            self._handle_health(started_at)
             return
         if path in {"/ready", "/health/ready"}:
-            ok, backend_msg = _is_vlm_backend_reachable()
-            if not ok:
-                self._send_json(503, {"status": "not_ready", "reason": backend_msg})
-                self._log_event(
-                    "readiness_check",
-                    path=path,
-                    status=503,
-                    durationMs=int((time.monotonic() - started_at) * 1000),
-                    error=backend_msg,
-                )
-                return
+            self._handle_ready(started_at)
+            return
+        self._send_json(404, {"error": "not found"})
+        self._log_event("request_rejected", path=path or "/", status=404,
+                        durationMs=int((time.monotonic() - started_at) * 1000),
+                        error="not found")
 
-            try:
-                _get_pipeline()
-            except Exception as exc:
-                self._send_json(503, {"status": "not_ready", "reason": f"pipeline init failed: {type(exc).__name__}: {exc}"})
-                self._log_event(
-                    "readiness_check",
-                    path=path,
-                    status=503,
-                    durationMs=int((time.monotonic() - started_at) * 1000),
-                    error=f"pipeline init failed: {type(exc).__name__}: {exc}",
-                )
-                return
+    def _handle_health(self, started_at: float) -> None:
+        self._send_json(200, {"status": "ok", "service": "paddleocr-daemon"})
+        self._log_event("health_check", path="/health", status=200,
+                        durationMs=int((time.monotonic() - started_at) * 1000))
 
-            self._send_json(200, {
-                "status": "ready",
+    def _handle_ready(self, started_at: float) -> None:
+        vlm_ok, vlm_detail = _is_vlm_backend_reachable()
+        if not vlm_ok:
+            self._send_json(503, {
+                "status": "not_ready",
                 "service": "paddleocr-daemon",
                 "vlmBackend": VLM_BACKEND,
                 "vlmServerUrl": VLM_SERVER_URL,
+                "reason": vlm_detail,
             })
-            self._log_event("readiness_check", path=path, status=200, durationMs=int((time.monotonic() - started_at) * 1000))
+            self._log_event("readiness_check", path="/ready", status=503,
+                            durationMs=int((time.monotonic() - started_at) * 1000),
+                            error=vlm_detail)
             return
-        self._send_json(404, {"error": "not found"})
-        self._log_event("request_rejected", path=path or "/", status=404, durationMs=int((time.monotonic() - started_at) * 1000), error="not found")
+
+        try:
+            _get_pipeline()
+        except Exception as exc:
+            msg = f"pipeline init failed: {type(exc).__name__}: {exc}"
+            self._send_json(503, {
+                "status": "not_ready",
+                "service": "paddleocr-daemon",
+                "vlmBackend": VLM_BACKEND,
+                "vlmServerUrl": VLM_SERVER_URL,
+                "reason": msg,
+            })
+            self._log_event("readiness_check", path="/ready", status=503,
+                            durationMs=int((time.monotonic() - started_at) * 1000),
+                            error=msg)
+            return
+
+        self._send_json(200, {
+            "status": "ready",
+            "service": "paddleocr-daemon",
+            "vlmBackend": VLM_BACKEND,
+            "vlmServerUrl": VLM_SERVER_URL,
+        })
+        self._log_event("readiness_check", path="/ready", status=200,
+                        durationMs=int((time.monotonic() - started_at) * 1000))
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path.rstrip("/")
@@ -348,6 +376,10 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
     # POST /layout-parsing  (official PaddleOCR-compatible API)
     # ------------------------------------------------------------------
+    def _reject_parse(self, log_id: str, started_at: float, code: int, msg: str) -> None:
+        self._send_json(400, _error_response(log_id, code, msg))
+        self._log_request(log_id, "/layout-parsing", 400, started_at, error=msg)
+
     def _handle_layout_parsing(self) -> None:
         log_id = uuid.uuid4().hex[:12]
         started_at = time.monotonic()
@@ -356,25 +388,17 @@ class Handler(BaseHTTPRequestHandler):
             length = _get_request_length(self.headers)
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, json.JSONDecodeError) as exc:
-            self._send_json(400, _error_response(log_id, 1, f"invalid JSON: {exc}"))
-            self._log_request(log_id, "/layout-parsing", 400, started_at, error=f"invalid JSON: {exc}")
+            self._reject_parse(log_id, started_at, 1, f"invalid JSON: {exc}")
             return
 
-        file_data = body.get("file", "")
-        file_type = _normalize_file_type(body.get("fileType"))  # 0=PDF, 1=image
-
-        # Keep PaddleOCR-compatible semantics: only `file` and `fileType` are
-        # interpreted, and any other request fields are ignored.
-        file_data = _extract_base64_payload(file_data)
-
+        file_data = _extract_base64_payload(body.get("file", ""))
         if not file_data:
-            self._send_json(400, _error_response(log_id, 1, "missing 'file' field"))
-            self._log_request(log_id, "/layout-parsing", 400, started_at, error="missing 'file' field")
+            self._reject_parse(log_id, started_at, 1, "missing 'file' field")
             return
 
+        file_type = _normalize_file_type(body.get("fileType"))
         if file_type is None:
-            self._send_json(400, _error_response(log_id, 1, "invalid 'fileType'; expected 0 or 1"))
-            self._log_request(log_id, "/layout-parsing", 400, started_at, error="invalid 'fileType'; expected 0 or 1")
+            self._reject_parse(log_id, started_at, 1, "invalid 'fileType'; expected 0 or 1")
             return
 
         sys.stderr.write(f"[daemon] [{log_id}] request fileType={file_type} size={len(file_data)}\n")
@@ -383,6 +407,9 @@ class Handler(BaseHTTPRequestHandler):
             result = self._process_file(log_id, file_data, file_type)
             self._send_json(200, result)
             self._log_request(log_id, "/layout-parsing", 200, started_at)
+        except ProcessingError as exc:
+            self._send_json(exc.http_status, _error_response(log_id, exc.error_code, str(exc)))
+            self._log_request(log_id, "/layout-parsing", exc.http_status, started_at, error=str(exc))
         except Exception as exc:
             tb = traceback.format_exc()
             sys.stderr.write(f"[daemon] [{log_id}] ERROR: {tb}\n")
@@ -397,12 +424,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = base64.b64decode(file_data, validate=True)
         except Exception:
-            return _error_response(log_id, 1, "invalid base64 in 'file' field")
+            raise ProcessingError(400, "invalid base64 in 'file' field")
 
         try:
             _validate_raw_size(raw)
         except ValueError as exc:
-            return _error_response(log_id, 1, str(exc))
+            raise ProcessingError(400, str(exc))
 
         suffix = ".pdf" if file_type == 0 else ".png"
         fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=TMP_DIR)
@@ -413,7 +440,18 @@ class Handler(BaseHTTPRequestHandler):
             pipeline = _get_pipeline()
 
             sys.stderr.write(f"[daemon] [{log_id}] running pipeline on {tmp_path}\n")
-            output = pipeline.predict(tmp_path)
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(pipeline.predict, tmp_path)
+                output = future.result(timeout=PREDICT_TIMEOUT)
+            except FutureTimeoutError:
+                raise ProcessingError(
+                    504,
+                    f"pipeline predict timed out after {PREDICT_TIMEOUT}s",
+                    error_code=2,
+                )
+            finally:
+                executor.shutdown(wait=False)
             sys.stderr.write(f"[daemon] [{log_id}] pipeline returned {len(output)} pages\n")
 
             result = _result_to_response(log_id, output)
